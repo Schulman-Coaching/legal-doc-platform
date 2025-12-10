@@ -1,0 +1,529 @@
+version: '3.8'
+
+# Legal Document Platform - Docker Compose Configuration
+# For development and staging environments
+
+services:
+  # ==========================================================================
+  # Infrastructure Services
+  # ==========================================================================
+
+  # PostgreSQL - Metadata Store
+  postgres:
+    image: postgres:15-alpine
+    container_name: legal-docs-postgres
+    environment:
+      POSTGRES_DB: legal_docs
+      POSTGRES_USER: legal_docs
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-legal_docs_secret}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-scripts/postgres:/docker-entrypoint-initdb.d
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U legal_docs"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - legal-docs-network
+
+  # Elasticsearch - Search Engine
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.0
+    container_name: legal-docs-elasticsearch
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=true
+      - xpack.security.enrollment.enabled=false
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD:-elastic_secret}
+      - "ES_JAVA_OPTS=-Xms2g -Xmx2g"
+      - cluster.name=legal-docs-cluster
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    ports:
+      - "9200:9200"
+      - "9300:9300"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:9200/_cluster/health | grep -q 'green\\|yellow'"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks:
+      - legal-docs-network
+
+  # MinIO - Object Storage
+  minio:
+    image: minio/minio:latest
+    container_name: legal-docs-minio
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minio_admin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minio_secret}
+    volumes:
+      - minio_data:/data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - legal-docs-network
+
+  # Redis - Cache & Sessions
+  redis:
+    image: redis:7-alpine
+    container_name: legal-docs-redis
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-redis_secret}
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-redis_secret}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - legal-docs-network
+
+  # Apache Kafka - Message Queue
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: legal-docs-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    volumes:
+      - zookeeper_data:/var/lib/zookeeper/data
+      - zookeeper_log:/var/lib/zookeeper/log
+    networks:
+      - legal-docs-network
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: legal-docs-kafka
+    depends_on:
+      - zookeeper
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    ports:
+      - "9092:9092"
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks:
+      - legal-docs-network
+
+  # Neo4j - Graph Database
+  neo4j:
+    image: neo4j:5.14.0-community
+    container_name: legal-docs-neo4j
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-neo4j_secret}
+      NEO4J_PLUGINS: '["apoc"]'
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7474"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks:
+      - legal-docs-network
+
+  # ClickHouse - Analytics
+  clickhouse:
+    image: clickhouse/clickhouse-server:23.10
+    container_name: legal-docs-clickhouse
+    environment:
+      CLICKHOUSE_DB: legal_analytics
+      CLICKHOUSE_USER: legal_analytics
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse_secret}
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+    ports:
+      - "8123:8123"
+      - "9010:9000"
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks:
+      - legal-docs-network
+
+  # HashiCorp Vault - Secrets Management
+  vault:
+    image: hashicorp/vault:1.15
+    container_name: legal-docs-vault
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: ${VAULT_TOKEN:-vault_dev_token}
+      VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
+    ports:
+      - "8200:8200"
+    cap_add:
+      - IPC_LOCK
+    networks:
+      - legal-docs-network
+
+  # Keycloak - Identity Management
+  keycloak:
+    image: quay.io/keycloak/keycloak:23.0
+    container_name: legal-docs-keycloak
+    environment:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_PASSWORD:-keycloak_secret}
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://postgres:5432/keycloak
+      KC_DB_USERNAME: legal_docs
+      KC_DB_PASSWORD: ${POSTGRES_PASSWORD:-legal_docs_secret}
+    command: start-dev
+    ports:
+      - "8180:8080"
+    depends_on:
+      - postgres
+    networks:
+      - legal-docs-network
+
+  # ==========================================================================
+  # Application Services
+  # ==========================================================================
+
+  # Ingestion Service
+  ingestion-service:
+    build:
+      context: ../../
+      dockerfile: infrastructure/docker/Dockerfile.ingestion
+    container_name: legal-docs-ingestion
+    environment:
+      KAFKA_SERVERS: kafka:29092
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: legal_docs
+      POSTGRES_USER: legal_docs
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-legal_docs_secret}
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minio_admin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minio_secret}
+      REDIS_HOST: redis
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-redis_secret}
+      VAULT_ADDR: http://vault:8200
+      VAULT_TOKEN: ${VAULT_TOKEN:-vault_dev_token}
+    ports:
+      - "8000:8000"
+    depends_on:
+      - postgres
+      - kafka
+      - minio
+      - redis
+      - vault
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - legal-docs-network
+
+  # Processing Service
+  processing-service:
+    build:
+      context: ../../
+      dockerfile: infrastructure/docker/Dockerfile.processing
+    container_name: legal-docs-processing
+    environment:
+      KAFKA_SERVERS: kafka:29092
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: legal_docs
+      POSTGRES_USER: legal_docs
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-legal_docs_secret}
+      ELASTICSEARCH_HOSTS: http://elasticsearch:9200
+      ELASTICSEARCH_PASSWORD: ${ELASTIC_PASSWORD:-elastic_secret}
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minio_admin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minio_secret}
+    ports:
+      - "8001:8001"
+    depends_on:
+      - postgres
+      - kafka
+      - elasticsearch
+      - minio
+    deploy:
+      replicas: 2
+    networks:
+      - legal-docs-network
+
+  # AI/ML Service
+  ai-ml-service:
+    build:
+      context: ../../
+      dockerfile: infrastructure/docker/Dockerfile.ai-ml
+    container_name: legal-docs-ai-ml
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: legal_docs
+      POSTGRES_USER: legal_docs
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-legal_docs_secret}
+      ELASTICSEARCH_HOSTS: http://elasticsearch:9200
+      ELASTICSEARCH_PASSWORD: ${ELASTIC_PASSWORD:-elastic_secret}
+      NEO4J_URI: bolt://neo4j:7687
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:-neo4j_secret}
+    ports:
+      - "8002:8002"
+    depends_on:
+      - postgres
+      - elasticsearch
+      - neo4j
+    networks:
+      - legal-docs-network
+
+  # Storage Service
+  storage-service:
+    build:
+      context: ../../
+      dockerfile: infrastructure/docker/Dockerfile.storage
+    container_name: legal-docs-storage
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: legal_docs
+      POSTGRES_USER: legal_docs
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-legal_docs_secret}
+      ELASTICSEARCH_HOSTS: http://elasticsearch:9200
+      ELASTICSEARCH_PASSWORD: ${ELASTIC_PASSWORD:-elastic_secret}
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minio_admin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minio_secret}
+      REDIS_HOST: redis
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-redis_secret}
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse_secret}
+    ports:
+      - "8003:8003"
+    depends_on:
+      - postgres
+      - elasticsearch
+      - minio
+      - redis
+      - clickhouse
+    networks:
+      - legal-docs-network
+
+  # API Gateway
+  api-gateway:
+    build:
+      context: ../../
+      dockerfile: infrastructure/docker/Dockerfile.api
+    container_name: legal-docs-api-gateway
+    environment:
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-jwt_secret_key_change_in_production}
+      INGESTION_SERVICE_URL: http://ingestion-service:8000
+      PROCESSING_SERVICE_URL: http://processing-service:8001
+      AI_ML_SERVICE_URL: http://ai-ml-service:8002
+      STORAGE_SERVICE_URL: http://storage-service:8003
+      SECURITY_SERVICE_URL: http://security-service:8004
+      KEYCLOAK_URL: http://keycloak:8080
+      REDIS_HOST: redis
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-redis_secret}
+    ports:
+      - "8080:8080"
+    depends_on:
+      - ingestion-service
+      - processing-service
+      - ai-ml-service
+      - storage-service
+      - keycloak
+      - redis
+    networks:
+      - legal-docs-network
+
+  # Security Service
+  security-service:
+    build:
+      context: ../../
+      dockerfile: infrastructure/docker/Dockerfile.security
+    container_name: legal-docs-security
+    environment:
+      VAULT_ADDR: http://vault:8200
+      VAULT_TOKEN: ${VAULT_TOKEN:-vault_dev_token}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: legal_docs
+      POSTGRES_USER: legal_docs
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-legal_docs_secret}
+      ELASTICSEARCH_HOSTS: http://elasticsearch:9200
+      ELASTICSEARCH_PASSWORD: ${ELASTIC_PASSWORD:-elastic_secret}
+    ports:
+      - "8004:8004"
+    volumes:
+      - audit_logs:/var/log/audit
+    depends_on:
+      - vault
+      - postgres
+      - elasticsearch
+    networks:
+      - legal-docs-network
+
+  # Monitoring Service
+  monitoring-service:
+    build:
+      context: ../../
+      dockerfile: infrastructure/docker/Dockerfile.monitoring
+    container_name: legal-docs-monitoring
+    environment:
+      PROMETHEUS_URL: http://prometheus:9090
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: legal_docs
+      POSTGRES_USER: legal_docs
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-legal_docs_secret}
+    ports:
+      - "8005:8005"
+    depends_on:
+      - prometheus
+      - postgres
+    networks:
+      - legal-docs-network
+
+  # ==========================================================================
+  # Monitoring Infrastructure
+  # ==========================================================================
+
+  # Prometheus
+  prometheus:
+    image: prom/prometheus:v2.47.0
+    container_name: legal-docs-prometheus
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./prometheus/alerts.yml:/etc/prometheus/alerts.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=30d'
+      - '--web.enable-lifecycle'
+    ports:
+      - "9090:9090"
+    networks:
+      - legal-docs-network
+
+  # Grafana
+  grafana:
+    image: grafana/grafana:10.2.0
+    container_name: legal-docs-grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-grafana_secret}
+      GF_INSTALL_PLUGINS: grafana-clock-panel,grafana-simple-json-datasource
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+      - ./grafana/dashboards:/var/lib/grafana/dashboards
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    networks:
+      - legal-docs-network
+
+  # Jaeger - Distributed Tracing
+  jaeger:
+    image: jaegertracing/all-in-one:1.51
+    container_name: legal-docs-jaeger
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "5775:5775/udp"
+      - "6831:6831/udp"
+      - "6832:6832/udp"
+      - "5778:5778"
+      - "16686:16686"
+      - "14268:14268"
+      - "14250:14250"
+      - "4317:4317"
+      - "4318:4318"
+    networks:
+      - legal-docs-network
+
+  # Kibana - Log visualization
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.11.0
+    container_name: legal-docs-kibana
+    environment:
+      ELASTICSEARCH_HOSTS: '["http://elasticsearch:9200"]'
+      ELASTICSEARCH_USERNAME: elastic
+      ELASTICSEARCH_PASSWORD: ${ELASTIC_PASSWORD:-elastic_secret}
+    ports:
+      - "5601:5601"
+    depends_on:
+      - elasticsearch
+    networks:
+      - legal-docs-network
+
+  # Alert Manager
+  alertmanager:
+    image: prom/alertmanager:v0.26.0
+    container_name: legal-docs-alertmanager
+    volumes:
+      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml
+      - alertmanager_data:/alertmanager
+    command:
+      - '--config.file=/etc/alertmanager/alertmanager.yml'
+      - '--storage.path=/alertmanager'
+    ports:
+      - "9093:9093"
+    networks:
+      - legal-docs-network
+
+# ==========================================================================
+# Volumes
+# ==========================================================================
+volumes:
+  postgres_data:
+  elasticsearch_data:
+  minio_data:
+  redis_data:
+  zookeeper_data:
+  zookeeper_log:
+  kafka_data:
+  neo4j_data:
+  neo4j_logs:
+  clickhouse_data:
+  prometheus_data:
+  grafana_data:
+  alertmanager_data:
+  audit_logs:
+
+# ==========================================================================
+# Networks
+# ==========================================================================
+networks:
+  legal-docs-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
