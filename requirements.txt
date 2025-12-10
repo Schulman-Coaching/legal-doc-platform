@@ -28,6 +28,23 @@ aiokafka>=0.10.0
 # MinIO/S3
 minio>=7.2.0
 boto3>=1.33.0
+botocore>=1.33.0
+
+# Azure
+azure-storage-blob>=12.19.0
+
+# Google Cloud
+google-cloud-storage>=2.14.0
+
+# SFTP
+paramiko>=3.4.0
+
+# File Watching
+watchdog>=3.0.0
+
+# Archive Support
+py7zr>=0.20.0
+rarfile>=4.1
 
 # Neo4j
 neo4j>=5.14.0
