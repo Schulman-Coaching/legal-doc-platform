@@ -38,9 +38,11 @@ class CloudEventType(str, Enum):
 @dataclass
 class CloudStorageConfig:
     """Base configuration for cloud storage connectors."""
-    provider: CloudProvider
-    # Bucket/container settings
+    # Required fields first
     bucket_name: str
+    # Provider with default for base class usage
+    provider: CloudProvider = field(default=CloudProvider.AWS_S3)
+    # Bucket/container settings
     prefix: str = ""
     # Polling settings
     poll_interval_seconds: int = 60
@@ -60,7 +62,7 @@ class CloudStorageConfig:
 @dataclass
 class S3Config(CloudStorageConfig):
     """AWS S3 specific configuration."""
-    provider: CloudProvider = CloudProvider.AWS_S3
+    provider: CloudProvider = field(default=CloudProvider.AWS_S3)
     # AWS credentials (use IAM role if not provided)
     aws_access_key_id: Optional[str] = None
     aws_secret_access_key: Optional[str] = None
@@ -77,7 +79,7 @@ class S3Config(CloudStorageConfig):
 @dataclass
 class AzureBlobConfig(CloudStorageConfig):
     """Azure Blob Storage specific configuration."""
-    provider: CloudProvider = CloudProvider.AZURE_BLOB
+    provider: CloudProvider = field(default=CloudProvider.AZURE_BLOB)
     # Azure credentials
     connection_string: Optional[str] = None
     account_name: Optional[str] = None
@@ -90,7 +92,7 @@ class AzureBlobConfig(CloudStorageConfig):
 @dataclass
 class GCSConfig(CloudStorageConfig):
     """Google Cloud Storage specific configuration."""
-    provider: CloudProvider = CloudProvider.GOOGLE_CLOUD_STORAGE
+    provider: CloudProvider = field(default=CloudProvider.GOOGLE_CLOUD_STORAGE)
     # GCS credentials
     credentials_path: Optional[str] = None
     project_id: Optional[str] = None

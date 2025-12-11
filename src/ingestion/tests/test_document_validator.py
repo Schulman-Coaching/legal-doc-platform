@@ -73,10 +73,11 @@ class TestDocumentValidator:
     @pytest.mark.asyncio
     async def test_validate_file_too_large(self, validator, temp_dir, sample_metadata):
         """Test validation of oversized file."""
-        large_file = temp_dir / "large.pdf"
-        large_file.write_bytes(b"%PDF-1.4\n" + b"x" * (101 * 1024 * 1024))  # 101 MB
+        large_file = temp_dir / "large.txt"
+        # Default max size is 100MB, so create a 101MB file with text/plain MIME type
+        large_file.write_bytes(b"x" * (101 * 1024 * 1024))  # 101 MB
         sample_metadata.file_size = large_file.stat().st_size
-        sample_metadata.mime_type = "application/pdf"
+        sample_metadata.mime_type = "text/plain"  # Default limit of 100MB
 
         is_valid, errors = await validator.validate(large_file, sample_metadata)
 
@@ -98,9 +99,14 @@ class TestDocumentValidator:
 
     @pytest.mark.asyncio
     async def test_validate_signature_mismatch(self, validator, temp_dir, sample_metadata):
-        """Test validation when file signature doesn't match claimed type."""
+        """Test validation when file signature doesn't match claimed type.
+
+        The validator checks if a detected signature matches the claimed type.
+        If a file has PNG magic bytes but claims to be a PDF, it should fail.
+        """
         fake_pdf = temp_dir / "fake.pdf"
-        fake_pdf.write_bytes(b"This is not a PDF")  # No PDF signature
+        # Write PNG magic bytes but claim it's a PDF
+        fake_pdf.write_bytes(b"\x89PNG\r\n\x1a\n" + b"x" * 100)
         sample_metadata.mime_type = "application/pdf"
         sample_metadata.file_size = fake_pdf.stat().st_size
 

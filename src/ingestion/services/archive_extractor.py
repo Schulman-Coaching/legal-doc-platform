@@ -185,25 +185,25 @@ class ArchiveExtractor:
             if data.startswith(signature):
                 return archive_type
 
-        # Check by extension
+        # Check for compound extensions first (.tar.gz, .tar.bz2)
+        filename_lower = filename.lower()
+        if filename_lower.endswith(".tar.gz") or filename_lower.endswith(".tgz"):
+            return ArchiveType.TAR_GZ
+        if filename_lower.endswith(".tar.bz2"):
+            return ArchiveType.TAR_BZ2
+
+        # Check by single extension
         ext = Path(filename).suffix.lower()
         ext_map = {
             ".zip": ArchiveType.ZIP,
             ".tar": ArchiveType.TAR,
             ".gz": ArchiveType.GZIP,
-            ".tgz": ArchiveType.TAR_GZ,
             ".7z": ArchiveType.SEVEN_ZIP,
             ".rar": ArchiveType.RAR,
         }
 
         if ext in ext_map:
             return ext_map[ext]
-
-        # Check for .tar.gz, .tar.bz2
-        if filename.lower().endswith(".tar.gz"):
-            return ArchiveType.TAR_GZ
-        if filename.lower().endswith(".tar.bz2"):
-            return ArchiveType.TAR_BZ2
 
         return None
 
