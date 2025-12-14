@@ -27,6 +27,39 @@ from pydantic import BaseModel, Field
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Constants for improved maintainability
+DEFAULT_CHUNK_TIMEOUT = 3600  # 1 hour
+MAX_FILE_SIZE_DEFAULT = 100 * 1024 * 1024  # 100 MB
+MAX_FILE_SIZE_PDF = 500 * 1024 * 1024  # 500 MB
+MAX_FILE_SIZE_TIFF = 1024 * 1024 * 1024  # 1 GB
+VALIDATION_SAMPLE_SIZE = 1024 * 1024  # 1 MB for dangerous content check
+
+
+# Custom exceptions for better error handling
+class IngestionError(Exception):
+    """Base exception for ingestion errors."""
+    pass
+
+
+class ValidationError(IngestionError):
+    """Raised when document validation fails."""
+    pass
+
+
+class EncryptionError(IngestionError):
+    """Raised when encryption/decryption fails."""
+    pass
+
+
+class StorageError(IngestionError):
+    """Raised when storage operations fail."""
+    pass
+
+
+class ConfigurationError(IngestionError):
+    """Raised when configuration is invalid."""
+    pass
+
 
 class IngestionSource(str, Enum):
     """Supported document ingestion sources."""
@@ -140,11 +173,11 @@ class DocumentValidator:
         'application/vnd.ms-outlook',
     }
 
-    # Maximum file sizes by type (in bytes)
+    # Maximum file sizes by type (in bytes) - using constants for maintainability
     MAX_FILE_SIZES = {
-        'application/pdf': 500 * 1024 * 1024,  # 500 MB
-        'image/tiff': 1024 * 1024 * 1024,  # 1 GB for large scans
-        'default': 100 * 1024 * 1024,  # 100 MB default
+        'application/pdf': MAX_FILE_SIZE_PDF,
+        'image/tiff': MAX_FILE_SIZE_TIFF,
+        'default': MAX_FILE_SIZE_DEFAULT,
     }
 
     # File signatures (magic bytes) for validation
@@ -160,19 +193,16 @@ class DocumentValidator:
     def __init__(self, enable_malware_scan: bool = True):
         self.enable_malware_scan = enable_malware_scan
 
-    async def validate(self, file_path: Path, metadata: DocumentMetadata) -> tuple[bool, list[str]]:
+    async def validate(self, file_path: Path, metadata: DocumentMetadata) -> None:
         """
         Validate a document for ingestion.
 
-        Returns:
-            Tuple of (is_valid, list of validation errors)
+        Raises:
+            ValidationError: If validation fails
         """
-        errors = []
-
         # Check file exists
         if not file_path.exists():
-            errors.append("File does not exist")
-            return False, errors
+            raise ValidationError("File does not exist")
 
         # Check file size
         file_size = file_path.stat().st_size
@@ -181,29 +211,27 @@ class DocumentValidator:
             self.MAX_FILE_SIZES['default']
         )
         if file_size > max_size:
-            errors.append(f"File size {file_size} exceeds maximum {max_size}")
+            raise ValidationError(f"File size {file_size} exceeds maximum {max_size}")
 
         # Validate MIME type
         if metadata.mime_type not in self.ALLOWED_MIME_TYPES:
-            errors.append(f"MIME type {metadata.mime_type} not allowed")
+            raise ValidationError(f"MIME type {metadata.mime_type} not allowed")
 
         # Validate file signature matches claimed type
         signature_valid = await self._validate_file_signature(file_path, metadata.mime_type)
         if not signature_valid:
-            errors.append("File signature does not match claimed type")
+            raise ValidationError("File signature does not match claimed type")
 
         # Check for potentially dangerous content
         dangerous = await self._check_dangerous_content(file_path)
         if dangerous:
-            errors.append("File contains potentially dangerous content")
+            raise ValidationError("File contains potentially dangerous content")
 
         # Malware scan (if enabled)
         if self.enable_malware_scan:
             malware_found = await self._scan_for_malware(file_path)
             if malware_found:
-                errors.append("Malware detected in file")
-
-        return len(errors) == 0, errors
+                raise ValidationError("Malware detected in file")
 
     async def _validate_file_signature(self, file_path: Path, claimed_type: str) -> bool:
         """Validate file magic bytes match claimed MIME type."""
@@ -235,7 +263,7 @@ class DocumentValidator:
         ]
 
         async with aiofiles.open(file_path, 'rb') as f:
-            content = await f.read(1024 * 1024)  # Check first 1MB
+            content = await f.read(VALIDATION_SAMPLE_SIZE)  # Check first sample size
 
         for pattern in dangerous_patterns:
             if pattern.lower() in content.lower():
@@ -335,6 +363,15 @@ class APIUploadConnector(BaseIngestionConnector):
 
     async def ingest(self, request: IngestionRequest, data: bytes) -> IngestionResponse:
         """Process an API upload request."""
+        # Edge case: empty file
+        if not data:
+            return IngestionResponse(
+                document_id="",
+                status=DocumentStatus.FAILED,
+                message="Empty file not allowed",
+                bytes_received=0,
+            )
+
         document_id = str(uuid.uuid4())
 
         try:
@@ -370,18 +407,7 @@ class APIUploadConnector(BaseIngestionConnector):
                 await f.write(data)
 
             # Validate document
-            is_valid, errors = await self.validator.validate(temp_path, metadata)
-
-            if not is_valid:
-                # Clean up and return error
-                temp_path.unlink(missing_ok=True)
-                return IngestionResponse(
-                    document_id=document_id,
-                    status=DocumentStatus.QUARANTINED,
-                    message=f"Validation failed: {'; '.join(errors)}",
-                    checksum=sha256,
-                    bytes_received=len(data),
-                )
+            await self.validator.validate(temp_path, metadata)
 
             # Encrypt and store
             encrypted_path = self.storage_path / f"{document_id}.enc"
@@ -401,12 +427,28 @@ class APIUploadConnector(BaseIngestionConnector):
                 bytes_received=len(data),
             )
 
-        except Exception as e:
-            logger.error(f"Ingestion failed for {document_id}: {e}")
+        except ValidationError as e:
+            logger.warning(f"Validation failed for {document_id}: {e}")
+            return IngestionResponse(
+                document_id=document_id,
+                status=DocumentStatus.QUARANTINED,
+                message=f"Validation failed: {str(e)}",
+                bytes_received=len(data),
+            )
+        except (StorageError, EncryptionError) as e:
+            logger.error(f"Storage/encryption failed for {document_id}: {e}")
             return IngestionResponse(
                 document_id=document_id,
                 status=DocumentStatus.FAILED,
-                message=f"Ingestion failed: {str(e)}",
+                message=f"Processing failed: {str(e)}",
+                bytes_received=len(data),
+            )
+        except Exception as e:
+            logger.error(f"Unexpected error for {document_id}: {e}")
+            return IngestionResponse(
+                document_id=document_id,
+                status=DocumentStatus.FAILED,
+                message=f"Unexpected error: {str(e)}",
                 bytes_received=len(data),
             )
 
@@ -414,7 +456,7 @@ class APIUploadConnector(BaseIngestionConnector):
 class ChunkedUploadManager:
     """Manages chunked uploads for large files."""
 
-    def __init__(self, storage_path: Path, chunk_timeout_seconds: int = 3600):
+    def __init__(self, storage_path: Path, chunk_timeout_seconds: int = DEFAULT_CHUNK_TIMEOUT):
         self.storage_path = storage_path / "chunks"
         self.storage_path.mkdir(parents=True, exist_ok=True)
         self.chunk_timeout = chunk_timeout_seconds
